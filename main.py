@@ -1,4 +1,3 @@
-import csv
 import re
 import subprocess
 import json
@@ -288,7 +287,7 @@ class IMPIMarcoScraper:
                 row['contacto'] = non_empty[4]
         return row
 
-    def _compile_brand_result(self, nombre, registro, expediente, tramites):
+    def _compile_brand_result(self, denominacion, registro, expediente, tramites, hoja=None):
         """Compile all tramite records for one brand into a hierarchical dict."""
         search_type = 'registro' if registro else 'expediente'
         search_value = registro or expediente
@@ -297,14 +296,18 @@ class IMPIMarcoScraper:
             len(t.get('detalle', {}).get('promociones', [])) for t in tramites
         )
 
-        return {
-            'marca': {
-                'nombre': nombre,
-                'busqueda': {
-                    'por': search_type,
-                    search_type: search_value,
-                },
+        marca = {
+            'denominacion': denominacion,
+            'busqueda': {
+                'por': search_type,
+                search_type: search_value,
             },
+        }
+        if hoja:
+            marca['hoja'] = hoja
+
+        return {
+            'marca': marca,
             'tramites': tramites,
             'resumen': {
                 'total_tramites': len(tramites),
@@ -312,6 +315,82 @@ class IMPIMarcoScraper:
                 'total_promociones': total_promociones,
             },
         }
+
+    @staticmethod
+    def _summarize_brands(marcas: list[dict]) -> dict:
+        return {
+            'total_marcas': len(marcas),
+            'total_tramites': sum(m.get('resumen', {}).get('total_tramites', 0) for m in marcas),
+            'total_oficios': sum(m.get('resumen', {}).get('total_oficios', 0) for m in marcas),
+            'total_promociones': sum(
+                m.get('resumen', {}).get('total_promociones', 0) for m in marcas
+            ),
+        }
+
+    def _process_brand_row(self, row, row_label):
+        denominacion = row['denominacion']
+        registro = row.get('registro', '')
+        expediente = row.get('expediente', '')
+        hoja = row.get('hoja')
+
+        self._report_progress(f"{denominacion}: conectando con IMPI")
+
+        detail_buttons = []
+        if registro:
+            self._report_progress(f"{denominacion}: buscando registro {registro}")
+            detail_buttons = self.search_by_registro(denominacion, registro)
+        else:
+            self._report_progress(f"{denominacion}: buscando expediente {expediente}")
+            detail_buttons = self.search_by_expediente(denominacion, expediente)
+
+        self._report_progress(
+            f"{denominacion}: {len(detail_buttons)} trámite(s) encontrado(s)",
+            extra_total=len(detail_buttons),
+        )
+
+        logger.info(f"{row_label}: Found {len(detail_buttons)} detail buttons to process")
+
+        tramites = []
+        for i, button_info in enumerate(detail_buttons):
+            tipo = button_info['row_data'].get('tipo_tramite', 'trámite')
+            self._report_progress(
+                f"{denominacion}: extrayendo trámite {i + 1}/{len(detail_buttons)} — {tipo}"
+            )
+            tramite = {
+                'indice': button_info['row_index'],
+                'resumen': button_info['row_data'],
+                'detalle': {'oficios': [], 'promociones': []},
+            }
+            try:
+                detail_data = self.extract_detail_data(button_info, denominacion)
+                tramite['detalle'] = {
+                    'oficios': detail_data['oficios'],
+                    'promociones': detail_data['promociones'],
+                }
+            except Exception as e:
+                logger.error(
+                    f"{row_label}, Button {button_info['row_index']}: "
+                    f"Error extracting detail - {e}"
+                )
+                tramite['error'] = str(e)
+            tramites.append(tramite)
+
+        brand_result = self._compile_brand_result(
+            denominacion, registro, expediente, tramites, hoja=hoja
+        )
+
+        logger.info(
+            f"{row_label}: Compiled brand result — "
+            f"{brand_result['resumen']['total_tramites']} trámite(s), "
+            f"{brand_result['resumen']['total_oficios']} oficio(s), "
+            f"{brand_result['resumen']['total_promociones']} promoción(es)"
+        )
+        print(f"\n{'='*80}")
+        print(f"BRAND: {denominacion}")
+        print(f"{'='*80}")
+        self._print_with_jq(brand_result)
+        print(f"{'='*80}\n")
+        return brand_result
 
     def _print_with_jq(self, data):
         """Pretty-print JSON to stdout using jq."""
@@ -391,6 +470,72 @@ class IMPIMarcoScraper:
             logger.error(f"Error parsing modal data: {e}")
             raise
 
+    def process_portfolio(self, sheet_batches: dict[str, list[dict]], on_progress=None):
+        """
+        Process brands grouped by Excel sheet.
+
+        Args:
+            sheet_batches: Mapping of sheet name to brand row dicts
+            on_progress: Optional callback(message: str, fraction: float)
+
+        Returns:
+            dict: Results grouped by sheet with overall summary
+        """
+        valid_rows = [row for rows in sheet_batches.values() for row in rows]
+        self._init_progress(on_progress, len(valid_rows))
+
+        hojas = []
+        all_marcas = []
+
+        for sheet_name, rows in sheet_batches.items():
+            marcas = []
+            for row in rows:
+                row_label = f"{sheet_name}, fila {row.get('fila', '?')}"
+                try:
+                    marcas.append(self._process_brand_row(row, row_label))
+                except Exception as e:
+                    logger.error(f"{row_label}: Error processing row - {e}")
+                    marcas.append({
+                        'marca': {
+                            'denominacion': row.get('denominacion', row_label),
+                            'hoja': sheet_name,
+                            'busqueda': {
+                                'por': 'registro' if row.get('registro') else 'expediente',
+                                **(
+                                    {'registro': row['registro']}
+                                    if row.get('registro')
+                                    else {'expediente': row.get('expediente', '')}
+                                ),
+                            },
+                        },
+                        'tramites': [],
+                        'resumen': {
+                            'total_tramites': 0,
+                            'total_oficios': 0,
+                            'total_promociones': 0,
+                        },
+                        'error': str(e),
+                    })
+
+            sheet_result = {
+                'hoja': sheet_name,
+                'marcas': marcas,
+                'resumen': self._summarize_brands(marcas),
+            }
+            hojas.append(sheet_result)
+            all_marcas.extend(marcas)
+
+        if on_progress:
+            on_progress("Completado", 1.0)
+
+        return {
+            'hojas': hojas,
+            'resumen': {
+                'total_hojas': len(hojas),
+                **self._summarize_brands(all_marcas),
+            },
+        }
+
     def process_csv(self, csv_source, on_progress=None):
         """
         Process the input CSV file or file-like object.
@@ -400,150 +545,38 @@ class IMPIMarcoScraper:
             on_progress: Optional callback(message: str, fraction: float)
 
         Returns:
-            list: Compiled brand result dicts
+            dict: Portfolio-style results with a single CSV sheet
         """
-        results = []
+        from portfolio import parse_csv, excel_to_brand_batches
+
         try:
             if isinstance(csv_source, str):
-                csv_file = open(csv_source, 'r', encoding='utf-8')
-                close_after = True
+                with open(csv_source, 'r', encoding='utf-8') as csv_file:
+                    previews = parse_csv(csv_file)
             else:
-                csv_file = csv_source
-                if hasattr(csv_file, 'seek'):
-                    csv_file.seek(0)
-                close_after = False
+                if hasattr(csv_source, 'seek'):
+                    csv_source.seek(0)
+                previews = parse_csv(csv_source)
 
-            try:
-                reader = list(csv.DictReader(csv_file))
-                valid_rows = [
-                    r for r in reader
-                    if r.get('nombre', '').strip()
-                    and (r.get('registro', '').strip() or r.get('expediente', '').strip())
-                ]
-                self._init_progress(on_progress, len(valid_rows))
-
-                for row_num, row in enumerate(reader, start=2):
-                    nombre = row.get('nombre', '').strip()
-                    registro = row.get('registro', '').strip()
-                    expediente = row.get('expediente', '').strip()
-
-                    try:
-                        if not nombre:
-                            logger.warning(f"Row {row_num}: 'nombre' is empty, skipping")
-                            continue
-
-                        if registro and expediente:
-                            logger.warning(
-                                f"Row {row_num}: Both 'registro' and 'expediente' present, "
-                                "using 'registro'"
-                            )
-
-                        if not registro and not expediente:
-                            logger.warning(
-                                f"Row {row_num}: Neither 'registro' nor 'expediente' present, "
-                                "skipping"
-                            )
-                            continue
-
-                        self._report_progress(f"{nombre}: connecting to IMPI")
-
-                        detail_buttons = []
-                        if registro:
-                            self._report_progress(f"{nombre}: searching registro {registro}")
-                            detail_buttons = self.search_by_registro(nombre, registro)
-                        else:
-                            self._report_progress(f"{nombre}: searching expediente {expediente}")
-                            detail_buttons = self.search_by_expediente(nombre, expediente)
-
-                        self._report_progress(
-                            f"{nombre}: found {len(detail_buttons)} trámite(s)",
-                            extra_total=len(detail_buttons),
-                        )
-
-                        logger.info(
-                            f"Row {row_num}: Found {len(detail_buttons)} detail buttons to process"
-                        )
-
-                        tramites = []
-                        for i, button_info in enumerate(detail_buttons):
-                            tipo = button_info['row_data'].get('tipo_tramite', 'trámite')
-                            self._report_progress(
-                                f"{nombre}: extracting trámite {i + 1}/{len(detail_buttons)} — "
-                                f"{tipo}"
-                            )
-                            tramite = {
-                                'indice': button_info['row_index'],
-                                'resumen': button_info['row_data'],
-                                'detalle': {'oficios': [], 'promociones': []},
-                            }
-                            try:
-                                detail_data = self.extract_detail_data(button_info, nombre)
-                                tramite['detalle'] = {
-                                    'oficios': detail_data['oficios'],
-                                    'promociones': detail_data['promociones'],
-                                }
-                            except Exception as e:
-                                logger.error(
-                                    f"Row {row_num}, Button {button_info['row_index']}: "
-                                    f"Error extracting detail - {e}"
-                                )
-                                tramite['error'] = str(e)
-                            tramites.append(tramite)
-
-                        brand_result = self._compile_brand_result(
-                            nombre, registro, expediente, tramites
-                        )
-                        results.append(brand_result)
-
-                        logger.info(
-                            f"Row {row_num}: Compiled brand result — "
-                            f"{brand_result['resumen']['total_tramites']} trámite(s), "
-                            f"{brand_result['resumen']['total_oficios']} oficio(s), "
-                            f"{brand_result['resumen']['total_promociones']} promoción(es)"
-                        )
-                        print(f"\n{'='*80}")
-                        print(f"BRAND: {nombre}")
-                        print(f"{'='*80}")
-                        self._print_with_jq(brand_result)
-                        print(f"{'='*80}\n")
-
-                    except Exception as e:
-                        logger.error(f"Row {row_num}: Error processing row - {e}")
-                        results.append({
-                            'marca': {
-                                'nombre': nombre or f'Row {row_num}',
-                                'busqueda': {
-                                    'por': 'registro' if registro else 'expediente',
-                                    **(
-                                        {'registro': registro}
-                                        if registro
-                                        else {'expediente': expediente}
-                                    ),
-                                },
-                            },
-                            'tramites': [],
-                            'resumen': {
-                                'total_tramites': 0,
-                                'total_oficios': 0,
-                                'total_promociones': 0,
-                            },
-                            'error': str(e),
-                        })
-                        continue
-            finally:
-                if close_after:
-                    csv_file.close()
-
-            if on_progress:
-                on_progress("Done", 1.0)
-
-            return results
-
+            return self.process_portfolio(
+                excel_to_brand_batches(previews),
+                on_progress=on_progress,
+            )
         except FileNotFoundError:
             logger.error(f"Input file not found: {csv_source}")
             raise
         except Exception as e:
             logger.error(f"Error reading CSV file: {e}")
+            raise
+
+    def run_portfolio(self, sheet_batches, on_progress=None):
+        """Run the scraper on Excel portfolio batches grouped by sheet."""
+        try:
+            if on_progress:
+                on_progress("Conectando con IMPI…", 0.0)
+            return self.process_portfolio(sheet_batches, on_progress=on_progress)
+        except Exception as e:
+            logger.error(f"Scraper error: {e}")
             raise
 
     def run(self, csv_file='input.csv', headless=False, on_progress=None):
@@ -562,7 +595,7 @@ class IMPIMarcoScraper:
             logger.debug("headless parameter is ignored; scraper uses direct HTTP requests")
         try:
             if on_progress:
-                on_progress("Connecting to IMPI…", 0.0)
+                on_progress("Conectando con IMPI…", 0.0)
             return self.process_csv(csv_file, on_progress=on_progress)
         except Exception as e:
             logger.error(f"Scraper error: {e}")

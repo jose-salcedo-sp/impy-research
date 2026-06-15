@@ -6,17 +6,19 @@ import pandas as pd
 import streamlit as st
 
 from main import IMPIMarcoScraper
+from portfolio import excel_to_brand_batches, parse_csv, parse_excel
 
 st.set_page_config(
-    page_title="IMPI Marcanet Scraper",
+    page_title="Extractor IMPI Marcanet",
     page_icon="®",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
-
-REQUIRED_COLUMNS = {"nombre", "registro", "expediente"}
 
 APP_STYLES = """
 <style>
+[data-testid="stSidebar"] { display: none; }
+[data-testid="stSidebarCollapsedControl"] { display: none; }
 .search-pill {
     display: inline-block;
     padding: 0.35rem 0.9rem;
@@ -43,17 +45,17 @@ def inject_styles():
     st.markdown(APP_STYLES, unsafe_allow_html=True)
 
 
-def validate_csv(uploaded_file) -> tuple[pd.DataFrame | None, str | None]:
+def load_portfolio_previews(uploaded_file) -> tuple[dict[str, pd.DataFrame] | None, str | None]:
+    filename = uploaded_file.name.lower()
     try:
-        df = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
+        if filename.endswith(".xlsx"):
+            return parse_excel(uploaded_file.getvalue()), None
+        if filename.endswith(".csv"):
+            text_stream = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
+            return parse_csv(text_stream), None
+        return None, "Tipo de archivo no compatible. Sube un archivo .xlsx o .csv."
     except Exception as e:
-        return None, f"Could not read CSV: {e}"
-
-    missing = REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        return None, f"Missing required columns: {', '.join(sorted(missing))}"
-
-    return df, None
+        return None, str(e)
 
 
 def render_search_pill(busqueda: dict):
@@ -73,7 +75,7 @@ def render_search_pill(busqueda: dict):
 
 def render_table(df: pd.DataFrame):
     if df.empty:
-        st.caption("No records.")
+        st.caption("Sin registros.")
         return
     st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -105,23 +107,23 @@ def render_tramite(tramite: dict):
         if oficios:
             render_table(pd.DataFrame(oficios))
         else:
-            st.caption("No oficios found.")
+            st.caption("No se encontraron oficios.")
 
         st.markdown("##### Promociones")
         if promociones:
             render_table(pd.DataFrame(promociones))
         else:
-            st.caption("No promociones found.")
+            st.caption("No se encontraron promociones.")
 
 
 def render_brand(brand: dict):
     marca = brand["marca"]
-    nombre = marca["nombre"]
+    denominacion = marca.get("denominacion") or marca.get("nombre", "—")
     busqueda = marca["busqueda"]
     resumen = brand.get("resumen", {})
 
     with st.container(border=True):
-        st.subheader(nombre)
+        st.subheader(denominacion)
         render_search_pill(busqueda)
 
         if brand.get("error"):
@@ -134,83 +136,95 @@ def render_brand(brand: dict):
 
         tramites = brand.get("tramites", [])
         if not tramites:
-            st.info("No trámites with detail views were found for this brand.")
+            st.info("No se encontraron trámites con vista de detalle para esta marca.")
             return
 
         for tramite in tramites:
             render_tramite(tramite)
 
 
-def render_results(results: list[dict]):
-    st.header("Results")
+def render_sheet_preview(sheet_previews: dict[str, pd.DataFrame]):
+    st.subheader("Vista previa por hoja")
+    tabs = st.tabs(list(sheet_previews.keys()))
+    for tab, sheet_name in zip(tabs, sheet_previews.keys()):
+        with tab:
+            df = sheet_previews[sheet_name]
+            st.caption(f"{len(df)} marca(s) en `{sheet_name}`")
+            render_table(df)
 
-    total_tramites = sum(r.get("resumen", {}).get("total_tramites", 0) for r in results)
-    total_oficios = sum(r.get("resumen", {}).get("total_oficios", 0) for r in results)
-    total_promociones = sum(r.get("resumen", {}).get("total_promociones", 0) for r in results)
 
-    summary_cols = st.columns(4)
-    summary_cols[0].metric("Brands", len(results))
-    summary_cols[1].metric("Trámites", total_tramites)
-    summary_cols[2].metric("Oficios", total_oficios)
-    summary_cols[3].metric("Promociones", total_promociones)
+def render_results(results: dict):
+    st.header("Resultados")
+
+    overall = results.get("resumen", {})
+    summary_cols = st.columns(5)
+    summary_cols[0].metric("Hojas", overall.get("total_hojas", 0))
+    summary_cols[1].metric("Marcas", overall.get("total_marcas", 0))
+    summary_cols[2].metric("Trámites", overall.get("total_tramites", 0))
+    summary_cols[3].metric("Oficios", overall.get("total_oficios", 0))
+    summary_cols[4].metric("Promociones", overall.get("total_promociones", 0))
 
     st.download_button(
-        label="Download JSON",
+        label="Descargar JSON",
         data=json.dumps(results, indent=2, ensure_ascii=False),
-        file_name="impi_results.json",
+        file_name="resultados_impi.json",
         mime="application/json",
     )
 
-    with st.expander("Raw JSON", expanded=False):
+    with st.expander("JSON sin procesar", expanded=False):
         st.json(results)
 
     st.divider()
 
-    for brand in results:
-        render_brand(brand)
+    for sheet in results.get("hojas", []):
+        sheet_name = sheet["hoja"]
+        sheet_summary = sheet.get("resumen", {})
+        with st.container(border=True):
+            st.subheader(sheet_name)
+            meta_cols = st.columns(4)
+            meta_cols[0].metric("Marcas", sheet_summary.get("total_marcas", 0))
+            meta_cols[1].metric("Trámites", sheet_summary.get("total_tramites", 0))
+            meta_cols[2].metric("Oficios", sheet_summary.get("total_oficios", 0))
+            meta_cols[3].metric("Promociones", sheet_summary.get("total_promociones", 0))
+
+            for brand in sheet.get("marcas", []):
+                render_brand(brand)
 
 
 def main():
     inject_styles()
 
-    st.title("IMPI Marcanet Scraper")
+    st.title("Extractor IMPI Marcanet")
     st.caption(
-        "Upload a CSV with columns `nombre`, `registro`, and `expediente`. "
-        "Provide either `registro` or `expediente` per row (not both)."
+        "Sube un archivo Excel de portafolio (p. ej. `PORTAFOLIO F&F.xlsx`) o CSV. "
+        "Cada hoja debe incluir `Denominación` y `Número de registro` o "
+        "`Número de expediente` (si ambos están presentes, se usa Registro)."
     )
 
-    with st.sidebar:
-        st.header("Options")
-        st.caption("Uses direct HTTP requests to IMPI (no browser required).")
-        st.markdown(
-            "**CSV format**\n\n"
-            "| nombre | registro | expediente |\n"
-            "|--------|----------|------------|\n"
-            "| EMPRESA A | 1284458 | |\n"
-            "| EMPRESA B | | 3326572 |"
-        )
-
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    uploaded = st.file_uploader("Subir archivo de portafolio", type=["xlsx", "csv"])
 
     if uploaded is None:
-        st.info("Upload a CSV file to get started.")
+        st.info("Sube un archivo Excel o CSV para comenzar.")
         return
 
-    df, error = validate_csv(uploaded)
+    previews, error = load_portfolio_previews(uploaded)
     if error:
         st.error(error)
         return
 
-    st.subheader("CSV preview")
-    render_table(df)
+    render_sheet_preview(previews)
 
-    run_clicked = st.button("Run scraper", type="primary", use_container_width=True)
+    total_brands = sum(len(df) for df in previews.values())
+    run_clicked = st.button(
+        f"Ejecutar extractor ({total_brands} marca(s) en {len(previews)} hoja(s))",
+        type="primary",
+        use_container_width=True,
+    )
 
     if run_clicked:
-        csv_text = uploaded.getvalue().decode("utf-8")
-        csv_stream = io.StringIO(csv_text)
+        sheet_batches = excel_to_brand_batches(previews)
 
-        progress_bar = st.progress(0, text="Starting…")
+        progress_bar = st.progress(0, text="Iniciando…")
         status = st.empty()
 
         def on_progress(message: str, fraction: float):
@@ -219,17 +233,20 @@ def main():
 
         try:
             scraper = IMPIMarcoScraper()
-            results = scraper.run(
-                csv_stream,
+            results = scraper.run_portfolio(
+                sheet_batches,
                 on_progress=on_progress,
             )
             st.session_state["results"] = results
-            progress_bar.progress(1.0, text="Complete")
-            status.success(f"Finished — {len(results)} brand(s) processed.")
+            progress_bar.progress(1.0, text="Completado")
+            status.success(
+                f"Finalizado — {results['resumen']['total_marcas']} marca(s) "
+                f"en {results['resumen']['total_hojas']} hoja(s)."
+            )
         except Exception as e:
             progress_bar.empty()
             status.empty()
-            st.error(f"Scraper failed: {e}")
+            st.error(f"Error en el extractor: {e}")
             return
 
     if "results" in st.session_state:
