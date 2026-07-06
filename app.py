@@ -122,7 +122,7 @@ def render_brand(brand: dict):
 
         tramites = brand.get("tramites", [])
         if not tramites:
-            st.info("No se encontraron trámites con vista de detalle para esta marca.")
+            st.info("No se encontraron promociones u oficios para esta marca.")
             return
 
         for tramite in tramites:
