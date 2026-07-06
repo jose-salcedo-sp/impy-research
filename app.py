@@ -129,8 +129,15 @@ def render_brand(brand: dict):
             render_tramite(tramite)
 
 
+def fetch_sheet_previews() -> tuple[dict[str, pd.DataFrame] | None, str | None]:
+    """Load previews from Google Sheets and store them in session state."""
+    previews, error = load_google_sheet_previews()
+    if not error and previews is not None:
+        st.session_state["sheet_previews"] = previews
+    return previews, error
+
+
 def render_sheet_preview(sheet_previews: dict[str, pd.DataFrame]):
-    st.subheader("Vista previa por hoja")
     tabs = st.tabs(list(sheet_previews.keys()))
     for tab, sheet_name in zip(tabs, sheet_previews.keys()):
         with tab:
@@ -188,13 +195,32 @@ def main():
         "`Número de expediente` (si ambos están presentes, se usa Registro)."
     )
 
-    with st.spinner("Cargando portafolio desde Google Sheets…"):
-        previews, error = load_google_sheet_previews()
+    header_col, refresh_col = st.columns([5, 1])
+    with header_col:
+        st.subheader("Vista previa por hoja")
+    with refresh_col:
+        refresh_clicked = st.button(
+            "Actualizar hoja",
+            use_container_width=True,
+            help="Vuelve a leer el Google Sheet si hubo cambios.",
+        )
+
+    if refresh_clicked:
+        with st.spinner("Actualizando portafolio desde Google Sheets…"):
+            previews, error = fetch_sheet_previews()
+    elif "sheet_previews" not in st.session_state:
+        with st.spinner("Cargando portafolio desde Google Sheets…"):
+            previews, error = fetch_sheet_previews()
+    else:
+        previews = st.session_state["sheet_previews"]
+        error = None
 
     if error:
         st.error(error)
-        return
+        if "sheet_previews" not in st.session_state:
+            return
 
+    previews = st.session_state["sheet_previews"]
     render_sheet_preview(previews)
 
     total_brands = sum(len(df) for df in previews.values())
@@ -205,12 +231,6 @@ def main():
     )
 
     if run_clicked:
-        with st.spinner("Actualizando portafolio desde Google Sheets…"):
-            previews, error = load_google_sheet_previews()
-        if error:
-            st.error(error)
-            return
-
         sheet_batches = excel_to_brand_batches(previews)
 
         progress_bar = st.progress(0, text="Iniciando…")
