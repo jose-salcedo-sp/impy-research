@@ -1,12 +1,12 @@
 # IMPI Marcanet Scraper
 
-Batch scraper for [IMPI Marcanet](https://acervomarcas.impi.gob.mx:8181/marcanet/) trademark search. Upload a portfolio Excel workbook (e.g. `PORTAFOLIO F&F.xlsx`) or CSV — each sheet is parsed for **Denominación** plus **Registro** or **Expediente**, then trámites, oficios, and promociones are fetched as structured JSON.
+Batch scraper for [IMPI Marcanet](https://acervomarcas.impi.gob.mx:8181/marcanet/) trademark search. Reads a [Google Sheets portfolio](https://docs.google.com/spreadsheets/d/1FZH0VgdxXdmUqIKlxwDsnNeFNiyYdns_TD9U-jAPSGo/edit) — each sheet is parsed for **Denominación** plus **Registro** or **Expediente**, then trámites, oficios, and promociones are fetched as structured JSON.
 
 Uses direct HTTP requests against IMPI's JSF partial-AJAX endpoints — no browser or Selenium required.
 
 ## Features
 
-- Parse multi-sheet Excel portfolios (`Denominación`, `Número de registro`, `Número de expediente`)
+- Read multi-sheet portfolios from Google Sheets (`Denominación`, `Número de registro`, `Número de expediente`)
 - Preview brands grouped by sheet name before running
 - Search by **Registro Nacional** or **Expediente** (Registro wins when both are present)
 - Extract trámite summaries from the results table
@@ -29,9 +29,11 @@ pip install -r requirements.txt
 
 ## Input format
 
-### Excel portfolio (recommended)
+### Google Sheets portfolio
 
-Upload a `.xlsx` workbook such as `PORTAFOLIO F&F.xlsx`. Each sheet should include:
+The scraper reads from a shared Google Sheet (default: [portfolio workbook](https://docs.google.com/spreadsheets/d/1FZH0VgdxXdmUqIKlxwDsnNeFNiyYdns_TD9U-jAPSGo/edit)). Override the sheet with the `GOOGLE_SHEET_ID` environment variable. The sheet is re-fetched on every run.
+
+Each tab should include:
 
 | Denominación | Número de registro | Número de expediente |
 |--------------|--------------------|----------------------|
@@ -45,15 +47,6 @@ Upload a `.xlsx` workbook such as `PORTAFOLIO F&F.xlsx`. Each sheet should inclu
 
 The Streamlit UI shows a **preview tab per sheet** before scraping.
 
-### CSV
-
-| denominacion | registro | expediente |
-|--------------|----------|------------|
-| EMPRESA A | 1284458 | |
-| EMPRESA B | | 3326572 |
-
-Also accepts `nombre` instead of `denominacion`. See `input.csv` for an example.
-
 ## Usage
 
 ### CLI
@@ -62,7 +55,7 @@ Also accepts `nombre` instead of `denominacion`. See `input.csv` for an example.
 python main.py
 ```
 
-Reads `input.csv` by default and prints JSON results to stdout.
+Fetches the Google Sheet portfolio and prints JSON results to stdout.
 
 ### Streamlit UI
 
@@ -70,7 +63,7 @@ Reads `input.csv` by default and prints JSON results to stdout.
 streamlit run app.py
 ```
 
-Upload a CSV, run the scraper, browse results, and download JSON.
+Loads the Google Sheet portfolio, run the scraper, browse results, and download JSON.
 
 ### Programmatic
 
@@ -78,7 +71,7 @@ Upload a CSV, run the scraper, browse results, and download JSON.
 from main import IMPIMarcoScraper
 
 scraper = IMPIMarcoScraper()
-results = scraper.run("input.csv")
+results = scraper.run_google_sheet()
 ```
 
 ## Output

@@ -1,8 +1,21 @@
 import io
+import os
 import re
 from typing import BinaryIO
 
 import pandas as pd
+import requests
+
+GOOGLE_SHEET_ID = os.environ.get(
+    "GOOGLE_SHEET_ID",
+    "1FZH0VgdxXdmUqIKlxwDsnNeFNiyYdns_TD9U-jAPSGo",
+)
+GOOGLE_SHEET_URL = (
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit"
+)
+GOOGLE_SHEET_EXPORT_URL = (
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=xlsx"
+)
 
 INVALID_ID_VALUES = {"", "-", "—", "n/a", "na", "none", "nan", "null"}
 
@@ -210,3 +223,20 @@ def parse_csv(source: BinaryIO | str) -> dict[str, pd.DataFrame]:
         columns=PREVIEW_COLUMNS,
     )
     return {"CSV": preview}
+
+
+def fetch_google_sheet_bytes(timeout: int = 60) -> bytes:
+    """Download the portfolio Google Sheet as an Excel workbook."""
+    response = requests.get(GOOGLE_SHEET_EXPORT_URL, timeout=timeout)
+    response.raise_for_status()
+    return response.content
+
+
+def load_google_sheet_previews() -> tuple[dict[str, pd.DataFrame] | None, str | None]:
+    """Fetch and parse the portfolio Google Sheet into preview DataFrames."""
+    try:
+        return parse_excel(fetch_google_sheet_bytes()), None
+    except requests.RequestException as e:
+        return None, f"No se pudo descargar el Google Sheet: {e}"
+    except Exception as e:
+        return None, str(e)

@@ -579,6 +579,18 @@ class IMPIMarcoScraper:
             logger.error(f"Scraper error: {e}")
             raise
 
+    def run_google_sheet(self, on_progress=None):
+        """Fetch the portfolio Google Sheet and run the scraper."""
+        from portfolio import excel_to_brand_batches, load_google_sheet_previews
+
+        previews, error = load_google_sheet_previews()
+        if error:
+            raise RuntimeError(error)
+        return self.run_portfolio(
+            excel_to_brand_batches(previews),
+            on_progress=on_progress,
+        )
+
     def run(self, csv_file='input.csv', headless=False, on_progress=None):
         """
         Main method to run the scraper.
@@ -604,4 +616,4 @@ class IMPIMarcoScraper:
 
 if __name__ == "__main__":
     scraper = IMPIMarcoScraper()
-    scraper.run('input.csv')
+    scraper.run_google_sheet()

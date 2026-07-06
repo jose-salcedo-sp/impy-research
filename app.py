@@ -1,4 +1,3 @@
-import io
 import html
 import json
 
@@ -6,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from main import IMPIMarcoScraper
-from portfolio import excel_to_brand_batches, parse_csv, parse_excel
+from portfolio import GOOGLE_SHEET_URL, excel_to_brand_batches, load_google_sheet_previews
 
 st.set_page_config(
     page_title="Extractor IMPI Marcanet",
@@ -43,19 +42,6 @@ APP_STYLES = """
 
 def inject_styles():
     st.markdown(APP_STYLES, unsafe_allow_html=True)
-
-
-def load_portfolio_previews(uploaded_file) -> tuple[dict[str, pd.DataFrame] | None, str | None]:
-    filename = uploaded_file.name.lower()
-    try:
-        if filename.endswith(".xlsx"):
-            return parse_excel(uploaded_file.getvalue()), None
-        if filename.endswith(".csv"):
-            text_stream = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
-            return parse_csv(text_stream), None
-        return None, "Tipo de archivo no compatible. Sube un archivo .xlsx o .csv."
-    except Exception as e:
-        return None, str(e)
 
 
 def render_search_pill(busqueda: dict):
@@ -196,18 +182,15 @@ def main():
 
     st.title("Extractor IMPI Marcanet")
     st.caption(
-        "Sube un archivo Excel de portafolio (p. ej. `PORTAFOLIO F&F.xlsx`) o CSV. "
+        "Lee el portafolio desde "
+        f"[Google Sheets]({GOOGLE_SHEET_URL}). "
         "Cada hoja debe incluir `Denominación` y `Número de registro` o "
         "`Número de expediente` (si ambos están presentes, se usa Registro)."
     )
 
-    uploaded = st.file_uploader("Subir archivo de portafolio", type=["xlsx", "csv"])
+    with st.spinner("Cargando portafolio desde Google Sheets…"):
+        previews, error = load_google_sheet_previews()
 
-    if uploaded is None:
-        st.info("Sube un archivo Excel o CSV para comenzar.")
-        return
-
-    previews, error = load_portfolio_previews(uploaded)
     if error:
         st.error(error)
         return
@@ -222,6 +205,12 @@ def main():
     )
 
     if run_clicked:
+        with st.spinner("Actualizando portafolio desde Google Sheets…"):
+            previews, error = load_google_sheet_previews()
+        if error:
+            st.error(error)
+            return
+
         sheet_batches = excel_to_brand_batches(previews)
 
         progress_bar = st.progress(0, text="Iniciando…")
