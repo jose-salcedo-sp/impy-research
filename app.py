@@ -137,7 +137,65 @@ def fetch_sheet_previews() -> tuple[dict[str, pd.DataFrame] | None, str | None]:
     return previews, error
 
 
+def sync_sheet_selection(available: list[str]) -> None:
+    """Keep selected sheets valid when the workbook is first loaded or refreshed."""
+    known = st.session_state.get("preview_sheet_names")
+    if known is None:
+        st.session_state.selected_sheets = available
+        st.session_state.preview_sheet_names = available
+        return
+    if known == available:
+        return
+
+    kept = [
+        name
+        for name in st.session_state.get("selected_sheets", [])
+        if name in available
+    ]
+    added = [name for name in available if name not in known]
+    st.session_state.selected_sheets = kept + added or list(available)
+    st.session_state.preview_sheet_names = available
+
+
+def render_sheet_selector(available: list[str]) -> list[str]:
+    sync_sheet_selection(available)
+
+    st.markdown("**Hojas a buscar**")
+    st.caption("Elige las pestañas del portafolio que se enviarán al extractor.")
+
+    select_col, all_col, none_col = st.columns([4, 1, 1])
+    with all_col:
+        st.button(
+            "Todas",
+            key="select_all_sheets",
+            use_container_width=True,
+            on_click=lambda: st.session_state.update(selected_sheets=list(available)),
+        )
+    with none_col:
+        st.button(
+            "Ninguna",
+            key="select_no_sheets",
+            use_container_width=True,
+            on_click=lambda: st.session_state.update(selected_sheets=[]),
+        )
+    with select_col:
+        selected = st.multiselect(
+            "Hojas a buscar",
+            options=available,
+            key="selected_sheets",
+            label_visibility="collapsed",
+            help="Solo las hojas seleccionadas se buscan en Marcanet.",
+        )
+
+    if not selected:
+        st.warning("Selecciona al menos una hoja para ejecutar el extractor.")
+    return selected
+
+
 def render_sheet_preview(sheet_previews: dict[str, pd.DataFrame]):
+    if not sheet_previews:
+        st.info("No hay hojas seleccionadas para previsualizar.")
+        return
     tabs = st.tabs(list(sheet_previews.keys()))
     for tab, sheet_name in zip(tabs, sheet_previews.keys()):
         with tab:
@@ -221,17 +279,22 @@ def main():
             return
 
     previews = st.session_state["sheet_previews"]
-    render_sheet_preview(previews)
+    selected_names = render_sheet_selector(list(previews.keys()))
+    selected_previews = {
+        name: previews[name] for name in selected_names if name in previews
+    }
+    render_sheet_preview(selected_previews)
 
-    total_brands = sum(len(df) for df in previews.values())
+    total_brands = sum(len(df) for df in selected_previews.values())
     run_clicked = st.button(
-        f"Ejecutar extractor ({total_brands} marca(s) en {len(previews)} hoja(s))",
+        f"Ejecutar extractor ({total_brands} marca(s) en {len(selected_previews)} hoja(s))",
         type="primary",
         use_container_width=True,
+        disabled=not selected_previews,
     )
 
     if run_clicked:
-        sheet_batches = excel_to_brand_batches(previews)
+        sheet_batches = excel_to_brand_batches(selected_previews)
 
         progress_bar = st.progress(0, text="Iniciando…")
         status = st.empty()

@@ -8,6 +8,7 @@ Uses direct HTTP requests against IMPI's JSF partial-AJAX endpoints — no brows
 
 - Read multi-sheet portfolios from Google Sheets (`Denominación`, `Número de registro`, `Número de expediente`)
 - Preview brands grouped by sheet name before running
+- Select which workbook sheets to search before running the extractor
 - Search by **Registro Nacional** or **Expediente** (Registro wins when both are present)
 - Extract trámite summaries from the results table
 - Fetch **Oficios** and **Promociones** detail for each trámite
@@ -45,7 +46,7 @@ Each tab should include:
 - If both IDs are present, **Registro** is always used
 - Sheets without a Denominación column are skipped
 
-The Streamlit UI shows a **preview tab per sheet** before scraping.
+The Streamlit UI shows a **preview tab per selected sheet** before scraping. Use **Hojas a buscar** to include or exclude workbook tabs; only the selected sheets are sent to Marcanet.
 
 ## Usage
 
@@ -63,7 +64,7 @@ Fetches the Google Sheet portfolio and prints JSON results to stdout.
 streamlit run app.py
 ```
 
-Loads the Google Sheet portfolio, run the scraper, browse results, and download JSON.
+Loads the Google Sheet portfolio, lets you pick which sheets to search, then run the scraper, browse results, and download JSON.
 
 ### Programmatic
 
