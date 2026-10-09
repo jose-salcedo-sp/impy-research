@@ -31,6 +31,10 @@ ERROR_HANDLER_MARCADOR = 'errorHandler/busquedaApp.pgi'
 class CuotaExcedidaError(RuntimeError):
     """Raised when IMPI rejects a request because the request quota is used up."""
 
+    def __init__(self, message, resultados=None):
+        super().__init__(message)
+        self.resultados = resultados
+
 
 class IMPIMarcoScraper:
     def __init__(self):
@@ -481,6 +485,111 @@ class IMPIMarcoScraper:
             return None
         match = re.search(r"window\.open\('([^']+)'", anchor.get('onclick', ''))
         return match.group(1) if match else None
+
+    def process_fonetica(self, sheet_batches, on_progress=None):
+        """
+        Run a phonetic search for each denominación and clase in the batches.
+
+        The same pair is sent to IMPI once. Later rows with that pair reuse
+        the first answer. A quota error stops the run and keeps what finished.
+
+        Args:
+            sheet_batches: Mapping of sheet name to rows with denominacion and clase.
+            on_progress: Optional callback(message: str, fraction: float)
+
+        Returns:
+            dict: Results grouped by sheet.
+        """
+        plan = [
+            (sheet_name, row)
+            for sheet_name, rows in sheet_batches.items()
+            for row in rows
+        ]
+        total = max(len(plan), 1)
+        grouped = {sheet_name: [] for sheet_name in sheet_batches}
+        vistos = {}
+
+        for indice, (sheet_name, row) in enumerate(plan):
+            clave = (row["denominacion"].casefold(), str(row["clase"]))
+            etiqueta = f"{row['denominacion']} (clase {row['clase']})"
+            if clave in vistos:
+                grouped[sheet_name].append(vistos[clave])
+                if on_progress:
+                    on_progress(f"{etiqueta}: ya consultada", (indice + 1) / total)
+                continue
+
+            def on_row_progress(message, fraction, indice=indice, etiqueta=etiqueta):
+                if on_progress:
+                    on_progress(f"{etiqueta}: {message}", (indice + fraction) / total)
+
+            try:
+                resultados = self.search_by_fonetica(
+                    row["denominacion"], row["clase"], on_progress=on_row_progress
+                )
+                item = self._fonetica_item(row, resultados)
+            except CuotaExcedidaError as error:
+                item = self._fonetica_item(row, [], error=str(error))
+                grouped[sheet_name].append(item)
+                vistos[clave] = item
+                raise CuotaExcedidaError(
+                    str(error), self._fonetica_salida(grouped)
+                ) from error
+            except Exception as error:
+                logger.error(f"{etiqueta}: {error}")
+                item = self._fonetica_item(row, [], error=str(error))
+
+            vistos[clave] = item
+            grouped[sheet_name].append(item)
+
+        if on_progress:
+            on_progress("Completado", 1.0)
+        return self._fonetica_salida(grouped)
+
+    @staticmethod
+    def _fonetica_item(row, resultados, error=None):
+        item = {
+            "busqueda": {
+                "denominacion": row["denominacion"],
+                "clase": str(row["clase"]),
+                "ventana_dias": FONETICA_VENTANA_DIAS,
+            },
+            "resultados": resultados,
+            "resumen": {"total_resultados": len(resultados)},
+        }
+        if error:
+            item["error"] = error
+        return item
+
+    @staticmethod
+    def _fonetica_salida(grouped):
+        hojas = []
+        unicas = {}
+        for sheet_name, busquedas in grouped.items():
+            if not busquedas:
+                continue
+            resultados_hoja = sum(
+                item["resumen"]["total_resultados"] for item in busquedas
+            )
+            hojas.append({
+                "hoja": sheet_name,
+                "busquedas": busquedas,
+                "resumen": {
+                    "total_busquedas": len(busquedas),
+                    "total_resultados": resultados_hoja,
+                },
+            })
+            for item in busquedas:
+                busqueda = item["busqueda"]
+                clave = (busqueda["denominacion"].casefold(), busqueda["clase"])
+                unicas[clave] = item["resumen"]["total_resultados"]
+        return {
+            "hojas": hojas,
+            "resumen": {
+                "total_hojas": len(hojas),
+                "total_busquedas": len(unicas),
+                "total_resultados": sum(unicas.values()),
+            },
+        }
 
     def run_fonetica(self, denominacion, clase, on_progress=None):
         """

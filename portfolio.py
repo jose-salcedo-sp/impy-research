@@ -19,7 +19,7 @@ GOOGLE_SHEET_EXPORT_URL = (
 
 INVALID_ID_VALUES = {"", "-", "—", "n/a", "na", "none", "nan", "null"}
 
-PREVIEW_COLUMNS = ["Denominación", "Registro", "Expediente"]
+PREVIEW_COLUMNS = ["Denominación", "Registro", "Expediente", "Clase"]
 
 
 def _normalize_col_name(col: str) -> str:
@@ -64,6 +64,14 @@ def _clean_id(value) -> str:
     return text
 
 
+def _clean_clase(value) -> str:
+    """Return a Nice class from 1 to 45, or "" when the cell is not one."""
+    text = _clean_id(value)
+    if re.fullmatch(r"\d{1,2}", text) and 1 <= int(text) <= 45:
+        return str(int(text))
+    return ""
+
+
 def _resolve_search_ids(registro: str, expediente: str) -> tuple[str, str]:
     registro = _clean_id(registro)
     expediente = _clean_id(expediente)
@@ -79,6 +87,7 @@ def _extract_brand_rows(df: pd.DataFrame, sheet_name: str) -> list[dict]:
 
     reg_col = _find_column(df.columns, r"n[uú]mero de registro")
     exp_col = _find_column(df.columns, r"n[uú]mero de expediente")
+    clase_col = _find_column(df.columns, r"^clase$")
 
     rows = []
     for row_num, row in df.iterrows():
@@ -86,6 +95,7 @@ def _extract_brand_rows(df: pd.DataFrame, sheet_name: str) -> list[dict]:
         registro_raw = _clean_text(row.get(reg_col, "")) if reg_col else ""
         expediente_raw = _clean_text(row.get(exp_col, "")) if exp_col else ""
         registro, expediente = _resolve_search_ids(registro_raw, expediente_raw)
+        clase = _clean_clase(row.get(clase_col, "")) if clase_col else ""
 
         if not denominacion:
             continue
@@ -98,6 +108,7 @@ def _extract_brand_rows(df: pd.DataFrame, sheet_name: str) -> list[dict]:
             "denominacion": denominacion,
             "registro": registro,
             "expediente": expediente,
+            "clase": clase,
         })
     return rows
 
@@ -138,6 +149,7 @@ def parse_excel(source: BinaryIO | bytes) -> dict[str, pd.DataFrame]:
                     "Denominación": row["denominacion"],
                     "Registro": row["registro"],
                     "Expediente": row["expediente"],
+                    "Clase": row["clase"],
                 }
                 for row in brand_rows
             ],
@@ -168,6 +180,51 @@ def excel_to_brand_batches(previews: dict[str, pd.DataFrame]) -> dict[str, list[
             for index, row in df.iterrows()
         ]
     return batches
+
+
+def _fonetica_rows(df: pd.DataFrame, sheet_name: str) -> list[dict]:
+    """Rows that can be sent to a phonetic search: denominación and clase."""
+    rows = []
+    vistos = set()
+    for index, row in df.iterrows():
+        denominacion = _clean_text(row.get("Denominación", ""))
+        clase = _clean_clase(row.get("Clase", ""))
+        if not denominacion or not clase:
+            continue
+        clave = (denominacion.casefold(), clase)
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        rows.append({
+            "hoja": sheet_name,
+            "fila": int(index) + 1,
+            "denominacion": denominacion,
+            "clase": clase,
+        })
+    return rows
+
+
+def excel_to_fonetica_batches(previews: dict[str, pd.DataFrame]) -> dict[str, list[dict]]:
+    """Convert preview DataFrames into phonetic searches grouped by sheet."""
+    batches: dict[str, list[dict]] = {}
+    for sheet_name, df in previews.items():
+        rows = _fonetica_rows(df, sheet_name)
+        if rows:
+            batches[sheet_name] = rows
+    return batches
+
+
+def fonetica_previews(previews: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Preview tables with only the columns a phonetic search uses."""
+    previews_out: dict[str, pd.DataFrame] = {}
+    for sheet_name, rows in excel_to_fonetica_batches(previews).items():
+        previews_out[sheet_name] = pd.DataFrame(
+            [
+                {"Denominación": row["denominacion"], "Clase": row["clase"]}
+                for row in rows
+            ]
+        )
+    return previews_out
 
 
 def parse_csv(source: BinaryIO | str) -> dict[str, pd.DataFrame]:
@@ -217,6 +274,7 @@ def parse_csv(source: BinaryIO | str) -> dict[str, pd.DataFrame]:
                 "Denominación": row["denominacion"],
                 "Registro": row["registro"],
                 "Expediente": row["expediente"],
+                "Clase": row.get("clase", ""),
             }
             for row in brand_rows
         ],

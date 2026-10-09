@@ -9,7 +9,13 @@ from main import (
     CuotaExcedidaError,
     IMPIMarcoScraper,
 )
-from portfolio import GOOGLE_SHEET_URL, excel_to_brand_batches, load_google_sheet_previews
+from portfolio import (
+    GOOGLE_SHEET_URL,
+    excel_to_brand_batches,
+    excel_to_fonetica_batches,
+    fonetica_previews,
+    load_google_sheet_previews,
+)
 
 st.set_page_config(
     page_title="Extractor IMPI Marcanet",
@@ -141,58 +147,70 @@ def fetch_sheet_previews() -> tuple[dict[str, pd.DataFrame] | None, str | None]:
     return previews, error
 
 
-def sync_sheet_selection(available: list[str]) -> None:
+def sync_sheet_selection(
+    available: list[str],
+    selection_key: str = "selected_sheets",
+    known_key: str = "preview_sheet_names",
+) -> None:
     """Keep selected sheets valid when the workbook is first loaded or refreshed."""
-    known = st.session_state.get("preview_sheet_names")
+    known = st.session_state.get(known_key)
     if known is None:
-        st.session_state.selected_sheets = available
-        st.session_state.preview_sheet_names = available
+        st.session_state[selection_key] = available
+        st.session_state[known_key] = available
         return
     if known == available:
         return
 
     kept = [
         name
-        for name in st.session_state.get("selected_sheets", [])
+        for name in st.session_state.get(selection_key, [])
         if name in available
     ]
     added = [name for name in available if name not in known]
-    st.session_state.selected_sheets = kept + added or list(available)
-    st.session_state.preview_sheet_names = available
+    st.session_state[selection_key] = kept + added or list(available)
+    st.session_state[known_key] = available
 
 
-def render_sheet_selector(available: list[str]) -> list[str]:
-    sync_sheet_selection(available)
+def render_sheet_selector(
+    available: list[str],
+    selection_key: str = "selected_sheets",
+    known_key: str = "preview_sheet_names",
+    caption: str = "Elige las pestañas del portafolio que se enviarán al extractor.",
+    empty_message: str = "Selecciona al menos una hoja para ejecutar el extractor.",
+) -> list[str]:
+    sync_sheet_selection(available, selection_key, known_key)
 
     st.markdown("**Hojas a buscar**")
-    st.caption("Elige las pestañas del portafolio que se enviarán al extractor.")
+    st.caption(caption)
 
     select_col, all_col, none_col = st.columns([4, 1, 1])
     with all_col:
         st.button(
             "Todas",
-            key="select_all_sheets",
+            key=f"{selection_key}_all",
             use_container_width=True,
-            on_click=lambda: st.session_state.update(selected_sheets=list(available)),
+            on_click=lambda: st.session_state.update(
+                {selection_key: list(available)}
+            ),
         )
     with none_col:
         st.button(
             "Ninguna",
-            key="select_no_sheets",
+            key=f"{selection_key}_none",
             use_container_width=True,
-            on_click=lambda: st.session_state.update(selected_sheets=[]),
+            on_click=lambda: st.session_state.update({selection_key: []}),
         )
     with select_col:
         selected = st.multiselect(
             "Hojas a buscar",
             options=available,
-            key="selected_sheets",
+            key=selection_key,
             label_visibility="collapsed",
             help="Solo las hojas seleccionadas se buscan en Marcanet.",
         )
 
     if not selected:
-        st.warning("Selecciona al menos una hoja para ejecutar el extractor.")
+        st.warning(empty_message)
     return selected
 
 
@@ -246,27 +264,7 @@ def render_results(results: dict):
                 render_brand(brand)
 
 
-def render_fonetica_results(resultado: dict):
-    st.header("Búsqueda fonética")
-    busqueda = resultado.get("busqueda", {})
-    st.markdown(
-        f"**Denominación:** {html.escape(str(busqueda.get('denominacion', '—')))} "
-        f"&nbsp;·&nbsp; **Clase:** {html.escape(str(busqueda.get('clase', '—')))}"
-    )
-
-    resultados = resultado.get("resultados", [])
-    sin_fecha = sum(1 for r in resultados if not r.get("fecha_publicacion_valida"))
-    meta_cols = st.columns(3)
-    meta_cols[0].metric("Resultados", len(resultados))
-    meta_cols[1].metric("Con fecha de publicación", len(resultados) - sin_fecha)
-    meta_cols[2].metric("Sin fecha de publicación", sin_fecha)
-
-    st.caption(
-        "Se descartan los resultados que ya tienen un Registro Nacional y los "
-        "que se publicaron hace más de "
-        f"{FONETICA_VENTANA_DIAS} días. Los resultados sin fecha se conservan."
-    )
-
+def render_fonetica_tabla(resultados: list):
     if not resultados:
         st.info("No hay resultados vigentes para esta búsqueda.")
         return
@@ -290,23 +288,149 @@ def render_fonetica_results(resultado: dict):
     df = df[[c for c in columnas if c in df.columns]]
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+
+def render_fonetica_busqueda(item: dict):
+    busqueda = item.get("busqueda", {})
+    resultados = item.get("resultados", [])
+    st.markdown(
+        f"**Denominación:** {html.escape(str(busqueda.get('denominacion', '—')))} "
+        f"&nbsp;·&nbsp; **Clase:** {html.escape(str(busqueda.get('clase', '—')))}"
+    )
+    if item.get("error"):
+        st.error(item["error"])
+
+    sin_fecha = sum(1 for r in resultados if not r.get("fecha_publicacion_valida"))
+    meta_cols = st.columns(3)
+    meta_cols[0].metric("Resultados", len(resultados))
+    meta_cols[1].metric("Con fecha de publicación", len(resultados) - sin_fecha)
+    meta_cols[2].metric("Sin fecha de publicación", sin_fecha)
+    render_fonetica_tabla(resultados)
+
+
+def render_fonetica_results(resultado: dict):
+    st.header("Búsqueda fonética")
+    st.caption(
+        "Se descartan los resultados que ya tienen un Registro Nacional y los "
+        "que se publicaron hace más de "
+        f"{FONETICA_VENTANA_DIAS} días. Los resultados sin fecha se conservan."
+    )
+
+    if "hojas" not in resultado:
+        render_fonetica_busqueda(resultado)
+        st.download_button(
+            label="Descargar JSON",
+            data=json.dumps(resultado, indent=2, ensure_ascii=False),
+            file_name="busqueda_fonetica.json",
+            mime="application/json",
+            key="download_fonetica_una",
+        )
+        return
+
+    overall = resultado.get("resumen", {})
+    summary_cols = st.columns(3)
+    summary_cols[0].metric("Hojas", overall.get("total_hojas", 0))
+    summary_cols[1].metric("Búsquedas", overall.get("total_busquedas", 0))
+    summary_cols[2].metric("Resultados", overall.get("total_resultados", 0))
     st.download_button(
         label="Descargar JSON",
         data=json.dumps(resultado, indent=2, ensure_ascii=False),
         file_name="busqueda_fonetica.json",
         mime="application/json",
+        key="download_fonetica_lote",
     )
+
+    for sheet in resultado.get("hojas", []):
+        sheet_summary = sheet.get("resumen", {})
+        with st.container(border=True):
+            st.subheader(sheet["hoja"])
+            meta_cols = st.columns(2)
+            meta_cols[0].metric("Búsquedas", sheet_summary.get("total_busquedas", 0))
+            meta_cols[1].metric("Resultados", sheet_summary.get("total_resultados", 0))
+            for item in sheet.get("busquedas", []):
+                with st.container(border=True):
+                    render_fonetica_busqueda(item)
 
 
 def render_fonetica_tab():
     st.subheader("Búsqueda fonética por denominación y clase")
     st.caption(
-        "Busca coincidencias fonéticas en Marcanet. Se descartan los "
-        "resultados con Registro Nacional y los publicados hace más de "
-        f"{FONETICA_VENTANA_DIAS} días. Cada resultado requiere leer su "
-        "detalle, por lo que la búsqueda tarda uno o dos minutos."
+        "Usa las hojas del portafolio. Cada fila se busca por Denominación y "
+        "Clase. Se descartan los resultados con Registro Nacional y los "
+        f"publicados hace más de {FONETICA_VENTANA_DIAS} días. Una misma "
+        "denominación y clase se consulta una sola vez."
     )
 
+    previews = st.session_state.get("sheet_previews")
+    sample = next(iter(previews.values()), None) if previews else None
+    if sample is None or "Clase" not in sample.columns:
+        with st.spinner("Cargando portafolio desde Google Sheets…"):
+            previews, error = fetch_sheet_previews()
+        if error or previews is None:
+            st.error(error or "No se pudo leer el portafolio.")
+            return
+
+    phonetic = fonetica_previews(previews)
+    if not phonetic:
+        st.warning("Ninguna hoja tiene filas con Denominación y Clase.")
+    else:
+        selected_names = render_sheet_selector(
+            list(phonetic.keys()),
+            selection_key="fonetica_selected_sheets",
+            known_key="fonetica_preview_sheet_names",
+            caption="Elige las pestañas cuyas marcas se buscarán por denominación y clase.",
+            empty_message="Selecciona al menos una hoja para buscar.",
+        )
+        selected_previews = {
+            name: phonetic[name] for name in selected_names if name in phonetic
+        }
+        render_sheet_preview(selected_previews)
+
+        total_brands = sum(len(df) for df in selected_previews.values())
+        buscar_lote = st.button(
+            f"Buscar coincidencias fonéticas ({total_brands} marca(s) en {len(selected_previews)} hoja(s))",
+            type="primary",
+            use_container_width=True,
+            disabled=not selected_previews,
+        )
+
+        if buscar_lote:
+            progress_bar = st.progress(0, text="Consultando el acervo fonético…")
+            status = st.empty()
+
+            def on_progress(message: str, fraction: float):
+                progress_bar.progress(min(max(fraction, 0.0), 1.0), text=message)
+                status.caption(message)
+
+            try:
+                resultado = IMPIMarcoScraper().process_fonetica(
+                    excel_to_fonetica_batches(selected_previews),
+                    on_progress=on_progress,
+                )
+                st.session_state["fonetica_resultado"] = resultado
+                progress_bar.progress(1.0, text="Completado")
+                status.success(
+                    f"Finalizado — {resultado['resumen']['total_busquedas']} "
+                    f"búsqueda(s), {resultado['resumen']['total_resultados']} resultado(s)."
+                )
+            except CuotaExcedidaError as e:
+                if e.resultados:
+                    st.session_state["fonetica_resultado"] = e.resultados
+                progress_bar.empty()
+                status.empty()
+                st.warning(str(e))
+            except Exception as e:
+                progress_bar.empty()
+                status.empty()
+                st.error(f"Error en la búsqueda fonética: {e}")
+
+    with st.expander("Búsqueda individual", expanded=False):
+        render_fonetica_individual()
+
+    if "fonetica_resultado" in st.session_state:
+        render_fonetica_results(st.session_state["fonetica_resultado"])
+
+
+def render_fonetica_individual():
     denom_col, clase_col = st.columns([4, 1])
     with denom_col:
         denominacion = st.text_input(
@@ -328,6 +452,7 @@ def render_fonetica_tab():
         type="primary",
         use_container_width=True,
         disabled=not denominacion.strip(),
+        key="fonetica_buscar_una",
     )
 
     if buscar:
@@ -363,10 +488,6 @@ def render_fonetica_tab():
             progress_bar.empty()
             status.empty()
             st.error(f"Error en la búsqueda fonética: {e}")
-            return
-
-    if "fonetica_resultado" in st.session_state:
-        render_fonetica_results(st.session_state["fonetica_resultado"])
 
 
 def run_portfolio_tab():
