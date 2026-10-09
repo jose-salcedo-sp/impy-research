@@ -1,6 +1,7 @@
 import re
 import subprocess
 import json
+import datetime
 import requests
 from bs4 import BeautifulSoup
 import logging
@@ -17,6 +18,19 @@ USER_AGENT = (
     'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
 )
 
+# Drop a phonetic result when its publication date is older than this window.
+FONETICA_VENTANA_DIAS = 30
+FECHA_PUBLICACION_FORMATO = '%d/%m/%Y'
+
+# IMPI answers a rate-limited request with HTTP 200 and this text in the page
+# body. The page is an error page, not a result page.
+CUOTA_MENSAJE = 'Has superado la cuota máxima de peticiones permitidas'
+ERROR_HANDLER_MARCADOR = 'errorHandler/busquedaApp.pgi'
+
+
+class CuotaExcedidaError(RuntimeError):
+    """Raised when IMPI rejects a request because the request quota is used up."""
+
 
 class IMPIMarcoScraper:
     def __init__(self):
@@ -27,6 +41,10 @@ class IMPIMarcoScraper:
         self.detail_url = (
             "https://acervomarcas.impi.gob.mx:8181/marcanet/vistas/common/"
             "busquedas/detalleExpedienteParcial.pgi"
+        )
+        self.fonetica_url = (
+            "https://acervomarcas.impi.gob.mx:8181/marcanet/vistas/common/"
+            "datos/bsqFoneticaCompleta.pgi"
         )
         self.session = None
         self._detail_view_state = None
@@ -182,6 +200,320 @@ class IMPIMarcoScraper:
         except Exception as e:
             logger.error(f"Error in search_by_expediente: {e}")
             raise
+
+    def search_by_fonetica(self, denominacion, clase, ventana_dias=FONETICA_VENTANA_DIAS,
+                           on_progress=None):
+        """
+        Search the phonetic database by denomination and class.
+
+        The page replays the previous result when the client reuses a
+        ViewState. This method therefore requests a new page for each search.
+
+        Two filters run on the results:
+
+        1. Drop every hit that already has a Registro Nacional.
+        2. Drop every hit whose "Fecha de publicación de la solicitud" is
+           older than `ventana_dias`. A hit with no publication date is kept.
+
+        Args:
+            denominacion (str): Brand name to search.
+            clase (str): Nice class number, 1 to 45.
+            ventana_dias (int): Maximum age of the publication date in days.
+            on_progress: Optional callback(message: str, fraction: float)
+
+        Returns:
+            list: Result dicts with the detail fields and the publication date.
+        """
+        try:
+            logger.info(
+                f"Phonetic search: denominacion='{denominacion}', clase='{clase}', "
+                f"ventana_dias={ventana_dias}"
+            )
+            html = self._fetch_fonetica_page()
+            view_state = self._extract_view_state(html)
+            if not view_state:
+                raise RuntimeError(
+                    "Could not extract javax.faces.ViewState from phonetic page"
+                )
+
+            response = self._get_session().post(
+                self.fonetica_url,
+                data={
+                    'javax.faces.partial.ajax': 'true',
+                    'javax.faces.source': 'frmBsqFonetica:busquedaId2',
+                    'javax.faces.partial.execute': '@all',
+                    'javax.faces.partial.render': 'frmBsqFonetica',
+                    'frmBsqFonetica:busquedaId2': 'frmBsqFonetica:busquedaId2',
+                    'frmBsqFonetica': 'frmBsqFonetica',
+                    'frmBsqFonetica:clases': str(clase),
+                    'frmBsqFonetica:denominacion': denominacion,
+                    'javax.faces.ViewState': view_state,
+                },
+                headers=self._ajax_headers(self.fonetica_url),
+                timeout=120,
+            )
+            response.raise_for_status()
+            self._check_respuesta_valida(response.text)
+
+            resultados, descartados = self._parse_fonetica_response(response.text)
+            logger.info(
+                f"Phonetic search '{denominacion}' class {clase}: "
+                f"{len(resultados)} result(s) without Registro, "
+                f"{descartados} with Registro dropped"
+            )
+
+            resultados = self._filter_fonetica_by_date(
+                resultados, ventana_dias, on_progress=on_progress
+            )
+            return resultados
+        except Exception as e:
+            logger.error(f"Error in search_by_fonetica: {e}")
+            raise
+
+    def _filter_fonetica_by_date(self, resultados, ventana_dias, on_progress=None):
+        """
+        Load each result's detail page and drop it when its date is too old.
+
+        A result with no publication date is kept. A result with an
+        unparseable date is kept and marked. A failed detail request stops the
+        filter, because a partial answer would mix two different rules.
+
+        Args:
+            resultados (list): Kept results from the result table.
+            ventana_dias (int): Maximum age of the publication date in days.
+            on_progress: Optional callback(message: str, fraction: float)
+
+        Returns:
+            list: Results that pass the date filter.
+        """
+        limite = datetime.date.today() - datetime.timedelta(days=ventana_dias)
+        total = len(resultados)
+        conservados = []
+        descartados_por_fecha = 0
+        sin_fecha = 0
+        consultados = 0
+
+        for indice, resultado in enumerate(resultados, start=1):
+            if on_progress:
+                on_progress(
+                    f"Consultando detalle {indice}/{total} — "
+                    f"{resultado.get('expediente', '?')}",
+                    indice / max(total, 1),
+                )
+
+            detalle = self._fetch_expediente_detalle(resultado.get('detalle_url'))
+            consultados += 1
+            fecha_texto = detalle.get('fecha_publicacion') or ''
+            resultado['numero_registro'] = detalle.get('numero_registro') or ''
+            resultado['fecha_presentacion'] = detalle.get('fecha_presentacion') or ''
+            resultado['fecha_publicacion'] = fecha_texto or None
+            resultado['fecha_publicacion_valida'] = bool(self._parse_fecha(fecha_texto))
+
+            fecha = self._parse_fecha(fecha_texto)
+            if fecha is None:
+                sin_fecha += 1
+                conservados.append(resultado)
+                continue
+            if fecha < limite:
+                descartados_por_fecha += 1
+                continue
+            conservados.append(resultado)
+
+        logger.info(
+            f"Date filter ({ventana_dias} days, limit {limite.isoformat()}): "
+            f"{len(conservados)} kept, {descartados_por_fecha} older dropped, "
+            f"{sin_fecha} without date kept, {consultados}/{total} details read"
+        )
+        return conservados
+
+    @staticmethod
+    def _parse_fecha(texto):
+        """Parse a DD/MM/YYYY date string. Return None when it is not a date."""
+        if not texto:
+            return None
+        try:
+            return datetime.datetime.strptime(
+                texto.strip(), FECHA_PUBLICACION_FORMATO
+            ).date()
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _check_respuesta_valida(texto):
+        """
+        Raise when a response is an IMPI error page that arrived with HTTP 200.
+
+        IMPI answers a rate-limited request with the normal page shell and the
+        quota message in the body. Without this check the caller reads the
+        error page as an empty result.
+        """
+        if CUOTA_MENSAJE in texto or ERROR_HANDLER_MARCADOR in texto:
+            raise CuotaExcedidaError(
+                "IMPI rechazó la petición: se superó la cuota máxima de "
+                "peticiones. Espera unos 10 minutos y vuelve a intentar."
+            )
+
+    def _fetch_expediente_detalle(self, detalle_url):
+        """
+        GET an expediente partial detail page and read its fields.
+
+        Returns:
+            dict: Field name to value, with the keys
+            ``numero_registro``, ``fecha_presentacion`` and
+            ``fecha_publicacion``.
+
+        Raises:
+            CuotaExcedidaError: IMPI rejected the request.
+            requests.RequestException: The request failed.
+        """
+        if not detalle_url:
+            raise RuntimeError("Result has no detail URL")
+        if detalle_url.startswith('/'):
+            detalle_url = 'https://acervomarcas.impi.gob.mx:8181' + detalle_url
+        response = self._get_session().get(
+            detalle_url,
+            headers={'Referer': self.fonetica_url},
+            timeout=60,
+        )
+        response.raise_for_status()
+        self._check_respuesta_valida(response.text)
+        detalle = self._parse_detalle_page(response.text)
+        if not detalle['fecha_publicacion_presente']:
+            raise RuntimeError(
+                "Detail page does not hold 'Fecha de publicación de la solicitud'"
+            )
+        return detalle
+
+    @staticmethod
+    def _parse_detalle_page(html):
+        """
+        Read the detail page fields into a dict with internal key names.
+
+        The page labels each field in Spanish. ``fecha_publicacion_presente``
+        reports whether the label exists at all, which is not the same as an
+        empty value.
+        """
+        pares = IMPIMarcoScraper._parse_detalle_pares(html)
+        etiqueta_fecha = 'Fecha de publicación de la solicitud'
+        return {
+            'numero_registro': pares.get('Número de registro', ''),
+            'fecha_presentacion': pares.get('Fecha de presentación', ''),
+            'fecha_publicacion': pares.get(etiqueta_fecha, ''),
+            'fecha_publicacion_presente': etiqueta_fecha in pares,
+        }
+
+    @staticmethod
+    def _parse_detalle_pares(html):
+        """
+        Parse the detail page into a label-to-value dict.
+
+        The page holds the fields in a table. Each row has a label cell and a
+        value cell.
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        pares = {}
+        for fila in soup.find_all('tr'):
+            celdas = fila.find_all(['td', 'th'])
+            textos = [c.get_text(' ', strip=True) for c in celdas]
+            textos = [t for t in textos if t]
+            if len(textos) >= 2:
+                pares[textos[0]] = textos[1]
+            elif len(textos) == 1:
+                pares.setdefault(textos[0], '')
+        return pares
+
+    def _fetch_fonetica_page(self):
+        """GET the phonetic page to obtain a session cookie and a fresh ViewState."""
+        session = self._get_session()
+        response = session.get(self.fonetica_url, timeout=60)
+        response.raise_for_status()
+        return response.text
+
+    @staticmethod
+    def _parse_fonetica_response(xml_text):
+        """
+        Parse a phonetic partial-AJAX response.
+
+        Returns:
+            tuple: (kept_results, dropped_count). A result is dropped when its
+            Registro cell is not empty.
+        """
+        match = re.search(
+            r'<update id="frmBsqFonetica"><!\[CDATA\[(.*?)\]\]></update>',
+            xml_text,
+            re.DOTALL,
+        )
+        if not match:
+            raise RuntimeError("Phonetic results update not found in response")
+
+        soup = BeautifulSoup(match.group(1), 'html.parser')
+        tbody = soup.find(id='frmBsqFonetica:resultadoExpediente_data')
+        if not tbody:
+            return [], 0
+
+        resultados = []
+        descartados = 0
+        for row in tbody.find_all('tr'):
+            cells = row.find_all('td')
+            if len(cells) < 8:
+                continue
+            texts = [c.get_text(' ', strip=True) for c in cells]
+            if texts[5]:
+                descartados += 1
+                continue
+            resultados.append({
+                'numero': texts[0],
+                'tipo_solicitud': texts[1],
+                'tipo_marca': texts[2],
+                'titular': texts[3],
+                'expediente': texts[4],
+                'denominacion': texts[6],
+                'clase': texts[7],
+                'detalle_url': IMPIMarcoScraper._extract_detalle_url(row),
+            })
+        return resultados, descartados
+
+    @staticmethod
+    def _extract_detalle_url(row):
+        """Read the expediente detail URL from a result row's anchor."""
+        anchor = row.find('a', id=re.compile(r'linkToDetail$'))
+        if not anchor:
+            return None
+        match = re.search(r"window\.open\('([^']+)'", anchor.get('onclick', ''))
+        return match.group(1) if match else None
+
+    def run_fonetica(self, denominacion, clase, on_progress=None):
+        """
+        Run one phonetic search and print the kept results as JSON.
+
+        Args:
+            denominacion (str): Brand name to search.
+            clase (str): Nice class number, 1 to 45.
+            on_progress: Optional callback(message: str, fraction: float)
+
+        Returns:
+            dict: Search parameters, results, and counts.
+        """
+        if on_progress:
+            on_progress("Conectando con IMPI…", 0.0)
+        resultados = self.search_by_fonetica(
+            denominacion, clase, on_progress=on_progress
+        )
+        if on_progress:
+            on_progress(
+                f"{len(resultados)} resultado(s) vigentes", 1.0
+            )
+        salida = {
+            'busqueda': {
+                'denominacion': denominacion,
+                'clase': str(clase),
+                'ventana_dias': FONETICA_VENTANA_DIAS,
+            },
+            'resultados': resultados,
+            'resumen': {'total_resultados': len(resultados)},
+        }
+        self._print_with_jq(salida)
+        return salida
 
     def _parse_results_table(self, html):
         """
@@ -615,5 +947,17 @@ class IMPIMarcoScraper:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="IMPI Marcanet scraper")
+    parser.add_argument("--fonetica", metavar="DENOMINACION",
+                        help="Run a phonetic search for this denomination")
+    parser.add_argument("--clase", default="41",
+                        help="Nice class for the phonetic search (default: 41)")
+    args = parser.parse_args()
+
     scraper = IMPIMarcoScraper()
-    scraper.run_google_sheet()
+    if args.fonetica:
+        scraper.run_fonetica(args.fonetica, args.clase)
+    else:
+        scraper.run_google_sheet()

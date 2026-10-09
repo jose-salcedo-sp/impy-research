@@ -10,6 +10,7 @@ Uses direct HTTP requests against IMPI's JSF partial-AJAX endpoints — no brows
 - Preview brands grouped by sheet name before running
 - Select which workbook sheets to search before running the extractor
 - Search by **Registro Nacional** or **Expediente** (Registro wins when both are present)
+- Search the **phonetic database** by `Denominación` and `Clase`
 - Extract trámite summaries from the results table
 - Fetch **Oficios** and **Promociones** detail for each trámite
 - CLI runner (`main.py`) and Streamlit web UI (`app.py`)
@@ -58,13 +59,21 @@ python main.py
 
 Fetches the Google Sheet portfolio and prints JSON results to stdout.
 
+Phonetic search:
+
+```bash
+python main.py --fonetica eteria --clase 41
+```
+
+`--clase` defaults to `41`.
+
 ### Streamlit UI
 
 ```bash
 streamlit run app.py
 ```
 
-Loads the Google Sheet portfolio, lets you pick which sheets to search, then run the scraper, browse results, and download JSON.
+Loads the Google Sheet portfolio, lets you pick which sheets to search, then run the scraper, browse results, and download JSON. The **Búsqueda fonética** tab runs a phonetic search by denomination and class.
 
 ### Programmatic
 
@@ -73,7 +82,41 @@ from main import IMPIMarcoScraper
 
 scraper = IMPIMarcoScraper()
 results = scraper.run_google_sheet()
+
+# Phonetic search
+hits = scraper.search_by_fonetica("eteria", "41")
 ```
+
+## Phonetic search
+
+`search_by_fonetica(denominacion, clase, ventana_dias=30)` returns the hits
+that pass two filters. Each hit has `numero`, `tipo_solicitud`, `tipo_marca`,
+`titular`, `expediente`, `denominacion`, `clase`, `numero_registro`,
+`fecha_presentacion`, `fecha_publicacion`, and `fecha_publicacion_valida`.
+
+| Filter | Rule |
+|---|---|
+| Registro | Drop every row whose `Registro` cell is not empty |
+| Publication date | Drop every row whose `Fecha de publicación de la solicitud` is older than `ventana_dias` |
+
+A row with no publication date is kept, because the absence of a date is not
+evidence that the publication is old.
+
+The date lives on the expediente detail page, not in the result table. The
+method therefore loads one detail page per kept row. Each detail page carries
+`Número de registro`, `Fecha de presentación`, and `Fecha de publicación de la
+solicitud`.
+
+### Protocol facts
+
+1. Each search needs a new `GET` of the phonetic page. The server replays the
+   previous result when the client reuses a `ViewState`.
+2. The result table holds at most 300 rows.
+3. IMPI answers a rate-limited request with HTTP 200 and an error page. The
+   page holds the text `Has superado la cuota máxima de peticiones`. The code
+   raises `CuotaExcedidaError` on this page. Wait about 10 minutes.
+4. One search reads one page per row. A search on a common name reads about
+   60 short pages.
 
 ## Output
 

@@ -4,7 +4,11 @@ import json
 import pandas as pd
 import streamlit as st
 
-from main import IMPIMarcoScraper
+from main import (
+    FONETICA_VENTANA_DIAS,
+    CuotaExcedidaError,
+    IMPIMarcoScraper,
+)
 from portfolio import GOOGLE_SHEET_URL, excel_to_brand_batches, load_google_sheet_previews
 
 st.set_page_config(
@@ -242,17 +246,130 @@ def render_results(results: dict):
                 render_brand(brand)
 
 
-def main():
-    inject_styles()
-
-    st.title("Extractor IMPI Marcanet")
-    st.caption(
-        "Lee el portafolio desde "
-        f"[Google Sheets]({GOOGLE_SHEET_URL}). "
-        "Cada hoja debe incluir `Denominación` y `Número de registro` o "
-        "`Número de expediente` (si ambos están presentes, se usa Registro)."
+def render_fonetica_results(resultado: dict):
+    st.header("Búsqueda fonética")
+    busqueda = resultado.get("busqueda", {})
+    st.markdown(
+        f"**Denominación:** {html.escape(str(busqueda.get('denominacion', '—')))} "
+        f"&nbsp;·&nbsp; **Clase:** {html.escape(str(busqueda.get('clase', '—')))}"
     )
 
+    resultados = resultado.get("resultados", [])
+    sin_fecha = sum(1 for r in resultados if not r.get("fecha_publicacion_valida"))
+    meta_cols = st.columns(3)
+    meta_cols[0].metric("Resultados", len(resultados))
+    meta_cols[1].metric("Con fecha de publicación", len(resultados) - sin_fecha)
+    meta_cols[2].metric("Sin fecha de publicación", sin_fecha)
+
+    st.caption(
+        "Se descartan los resultados que ya tienen un Registro Nacional y los "
+        "que se publicaron hace más de "
+        f"{FONETICA_VENTANA_DIAS} días. Los resultados sin fecha se conservan."
+    )
+
+    if not resultados:
+        st.info("No hay resultados vigentes para esta búsqueda.")
+        return
+
+    df = pd.DataFrame(resultados).rename(columns={
+        "numero": "#",
+        "tipo_solicitud": "TS",
+        "tipo_marca": "TM",
+        "titular": "Titular",
+        "expediente": "Expediente",
+        "numero_registro": "Registro",
+        "denominacion": "Denominación",
+        "clase": "Clase",
+        "fecha_presentacion": "Fecha de presentación",
+        "fecha_publicacion": "Fecha de publicación de la solicitud",
+    })
+    columnas = [
+        "#", "TS", "TM", "Titular", "Expediente", "Registro", "Denominación",
+        "Clase", "Fecha de presentación", "Fecha de publicación de la solicitud",
+    ]
+    df = df[[c for c in columnas if c in df.columns]]
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        label="Descargar JSON",
+        data=json.dumps(resultado, indent=2, ensure_ascii=False),
+        file_name="busqueda_fonetica.json",
+        mime="application/json",
+    )
+
+
+def render_fonetica_tab():
+    st.subheader("Búsqueda fonética por denominación y clase")
+    st.caption(
+        "Busca coincidencias fonéticas en Marcanet. Se descartan los "
+        "resultados con Registro Nacional y los publicados hace más de "
+        f"{FONETICA_VENTANA_DIAS} días. Cada resultado requiere leer su "
+        "detalle, por lo que la búsqueda tarda uno o dos minutos."
+    )
+
+    denom_col, clase_col = st.columns([4, 1])
+    with denom_col:
+        denominacion = st.text_input(
+            "Denominación",
+            key="fonetica_denominacion",
+            placeholder="Ej. ETERIA",
+        )
+    with clase_col:
+        clase = st.text_input(
+            "Clase",
+            key="fonetica_clase",
+            value="41",
+            max_chars=2,
+            help="Clase de Niza, 1 a 45.",
+        )
+
+    buscar = st.button(
+        "Buscar coincidencias fonéticas",
+        type="primary",
+        use_container_width=True,
+        disabled=not denominacion.strip(),
+    )
+
+    if buscar:
+        clase_valor = clase.strip()
+        progress_bar = st.progress(0, text="Consultando el acervo fonético…")
+        status = st.empty()
+
+        def on_progress(message: str, fraction: float):
+            progress_bar.progress(min(max(fraction, 0.0), 1.0), text=message)
+            status.caption(message)
+
+        try:
+            resultados = IMPIMarcoScraper().search_by_fonetica(
+                denominacion.strip(), clase_valor, on_progress=on_progress
+            )
+            st.session_state["fonetica_resultado"] = {
+                "busqueda": {
+                    "denominacion": denominacion.strip(),
+                    "clase": clase_valor,
+                    "ventana_dias": FONETICA_VENTANA_DIAS,
+                },
+                "resultados": resultados,
+                "resumen": {"total_resultados": len(resultados)},
+            }
+            progress_bar.progress(1.0, text="Completado")
+            status.empty()
+        except CuotaExcedidaError as e:
+            progress_bar.empty()
+            status.empty()
+            st.warning(str(e))
+            return
+        except Exception as e:
+            progress_bar.empty()
+            status.empty()
+            st.error(f"Error en la búsqueda fonética: {e}")
+            return
+
+    if "fonetica_resultado" in st.session_state:
+        render_fonetica_results(st.session_state["fonetica_resultado"])
+
+
+def run_portfolio_tab():
     header_col, refresh_col = st.columns([5, 1])
     with header_col:
         st.subheader("Vista previa por hoja")
@@ -323,6 +440,25 @@ def main():
 
     if "results" in st.session_state:
         render_results(st.session_state["results"])
+
+
+def main():
+    inject_styles()
+
+    st.title("Extractor IMPI Marcanet")
+    st.caption(
+        "Portafolio desde "
+        f"[Google Sheets]({GOOGLE_SHEET_URL}) y búsqueda fonética por "
+        "denominación y clase."
+    )
+
+    portafolio_tab, fonetica_tab = st.tabs(
+        ["Portafolio", "Búsqueda fonética"]
+    )
+    with portafolio_tab:
+        run_portfolio_tab()
+    with fonetica_tab:
+        render_fonetica_tab()
 
 
 if __name__ == "__main__":
